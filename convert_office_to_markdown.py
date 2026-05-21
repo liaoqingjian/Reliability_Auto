@@ -24,7 +24,7 @@ from pathlib import Path
 from markitdown import MarkItDown
 
 # ========== 在此修改为你的单个文件路径 ==========
-SOURCE_FILE = r"SHAT2604006840PSJ05.doc"
+SOURCE_FILE = r"GZMR260100300601_CN.docx"
 # 输出目录：None 表示与源文件同目录，生成「同名.md」及「同名_assets」资源目录
 OUTPUT_DIR: Path | None = None
 ENABLE_PLUGINS = False
@@ -224,7 +224,7 @@ class _DocxNumberingResolver:
         try:
             numbering_part = document.part.numbering_part  # type: ignore[attr-defined]
             elem = getattr(numbering_part, "element", None)
-        except (AttributeError, KeyError):
+        except (AttributeError, KeyError, NotImplementedError):
             elem = None
         if elem is None:
             return
@@ -653,6 +653,111 @@ def _docx_unique_cells_in_row(row: object) -> list:
     return out
 
 
+def _docx_tc_merge_info(tc: object) -> tuple[int, str | None]:
+    """读取 <w:tc> 的合并信息，返回 (colspan, vmerge)。
+    colspan ≥ 1，vmerge ∈ {"restart", "continue", None}。
+    """
+    from docx.oxml.ns import qn
+
+    tc_pr = tc.find(qn("w:tcPr"))
+    colspan = 1
+    vmerge: str | None = None
+    if tc_pr is not None:
+        gs = tc_pr.find(qn("w:gridSpan"))
+        if gs is not None:
+            try:
+                colspan = max(1, int(gs.get(qn("w:val")) or 1))
+            except (TypeError, ValueError):
+                colspan = 1
+        vm = tc_pr.find(qn("w:vMerge"))
+        if vm is not None:
+            val = vm.get(qn("w:val"))
+            vmerge = "restart" if val == "restart" else "continue"
+    return colspan, vmerge
+
+
+def _docx_table_has_merges(table: object) -> bool:
+    """表格中是否存在横向合并 (gridSpan>1) 或纵向合并 (vMerge)。"""
+    from docx.oxml.ns import qn
+
+    for tr in table._tbl.findall(qn("w:tr")):
+        for tc in tr.findall(qn("w:tc")):
+            colspan, vmerge = _docx_tc_merge_info(tc)
+            if colspan > 1 or vmerge is not None:
+                return True
+    return False
+
+
+def _docx_table_layout(table: object) -> list[list[dict]]:
+    """将 table 解析为带 rowspan/colspan 的 2D 布局；vMerge 续接单元格被略去。
+    每个 cell dict: {"tc": <w:tc>, "rowspan": int, "colspan": int}。
+    """
+    from docx.oxml.ns import qn
+
+    trs = table._tbl.findall(qn("w:tr"))
+    nrows = len(trs)
+
+    raw_rows: list[list[dict]] = []
+    for tr in trs:
+        col = 0
+        row_info: list[dict] = []
+        for tc in tr.findall(qn("w:tc")):
+            colspan, vmerge = _docx_tc_merge_info(tc)
+            row_info.append(
+                {
+                    "tc": tc,
+                    "col": col,
+                    "colspan": colspan,
+                    "vmerge": vmerge,
+                }
+            )
+            col += colspan
+        raw_rows.append(row_info)
+
+    out_rows: list[list[dict]] = []
+    for r_idx in range(nrows):
+        out_row: list[dict] = []
+        for cell in raw_rows[r_idx]:
+            if cell["vmerge"] == "continue":
+                continue
+            rowspan = 1
+            if cell["vmerge"] == "restart":
+                for r2 in range(r_idx + 1, nrows):
+                    extended = False
+                    for c2 in raw_rows[r2]:
+                        if c2["col"] == cell["col"] and c2["vmerge"] == "continue":
+                            rowspan += 1
+                            extended = True
+                            break
+                    if not extended:
+                        break
+            out_row.append(
+                {
+                    "tc": cell["tc"],
+                    "rowspan": rowspan,
+                    "colspan": cell["colspan"],
+                }
+            )
+        out_rows.append(out_row)
+    return out_rows
+
+
+def _docx_wrap_tc_as_cell(tc: object, parent: object) -> object:
+    """以 python-docx 的 _Cell 包装一个 <w:tc> 元素以便复用已有内容提取逻辑。"""
+    from docx.table import _Cell
+
+    return _Cell(tc, parent)
+
+
+def _docx_td_attrs(rowspan: int, colspan: int) -> str:
+    attrs = ""
+    if rowspan > 1:
+        attrs += f' rowspan="{rowspan}"'
+    if colspan > 1:
+        attrs += f' colspan="{colspan}"'
+    return attrs
+
+
 def _docx_table_grid_shape(table: object) -> tuple[int, int]:
     rows = table.rows
     if not rows:
@@ -867,15 +972,18 @@ def _docx_table_to_inline_html(
     depth: int = 0,
     numbering: "_DocxNumberingResolver | None" = None,
 ) -> str:
-    """整张表 → 单行 <table>…</table> HTML 字符串（可递归嵌套）。"""
+    """整张表 → 单行 <table>…</table> HTML 字符串（可递归嵌套；支持 rowspan/colspan）。"""
     parts: list[str] = ['<table border="1">']
-    for row in table.rows:
+    for row in _docx_table_layout(table):
         parts.append("<tr>")
-        for cell in _docx_unique_cells_in_row(row):
+        for cell in row:
+            cell_obj = _docx_wrap_tc_as_cell(cell["tc"], table)
             inner = _docx_cell_to_inline_html(
-                cell, assets_dir, rel_prefix, img_counter, depth, numbering
+                cell_obj, assets_dir, rel_prefix, img_counter, depth, numbering
             )
-            parts.append(f"<td>{inner}</td>")
+            parts.append(
+                f"<td{_docx_td_attrs(cell['rowspan'], cell['colspan'])}>{inner}</td>"
+            )
         parts.append("</tr>")
     parts.append("</table>")
     return "".join(parts)
@@ -890,19 +998,20 @@ def _docx_table_to_block_html(
     numbering: "_DocxNumberingResolver | None" = None,
 ) -> str:
     """
-    含嵌套时整张外层表也用块级 HTML <table> 输出（每行 <tr> 单独一行，便于源码阅读）。
-    单元格内容由 _docx_cell_to_inline_html 生成单行 HTML 片段；嵌套表 / 孙子表递归
-    继续是 HTML。这样所有渲染器（含 Typora，它不允许 pipe 单元格里有块级 <table>）
-    都能正确显示嵌套表的「就地」位置。
+    含嵌套 / 合并单元格时整张外层表用块级 HTML <table> 输出（每行 <tr> 单独一行）。
+    合并通过 rowspan/colspan 属性精确还原；vMerge 续接单元格被跳过。
     """
     lines: list[str] = ['<table border="1">']
-    for row in table.rows:
+    for row in _docx_table_layout(table):
         parts = ["<tr>"]
-        for cell in _docx_unique_cells_in_row(row):
+        for cell in row:
+            cell_obj = _docx_wrap_tc_as_cell(cell["tc"], table)
             inner = _docx_cell_to_inline_html(
-                cell, assets_dir, rel_prefix, img_counter, depth, numbering
+                cell_obj, assets_dir, rel_prefix, img_counter, depth, numbering
             )
-            parts.append(f"<td>{inner}</td>")
+            parts.append(
+                f"<td{_docx_td_attrs(cell['rowspan'], cell['colspan'])}>{inner}</td>"
+            )
         parts.append("</tr>")
         lines.append("".join(parts))
     lines.append("</table>")
@@ -917,7 +1026,8 @@ def _docx_table_to_md(
     depth: int = 0,
     numbering: "_DocxNumberingResolver | None" = None,
 ) -> str:
-    if _docx_table_has_nested(table):
+    # 嵌套表或含合并单元格 → 块级 HTML（管道表语法不支持 rowspan/colspan）
+    if _docx_table_has_nested(table) or _docx_table_has_merges(table):
         return _docx_table_to_block_html(
             table, assets_dir, rel_prefix, img_counter, depth, numbering
         )
@@ -955,29 +1065,39 @@ def convert_docx_structured(source: Path, md_path: Path) -> str:
     from docx import Document
     from docx.table import Table
 
-    doc = Document(str(source.resolve()))
-    assets = _assets_dir(md_path)
-    prefix = _rel_assets_prefix(md_path)
-    img_counter = [0]
-    numbering = _DocxNumberingResolver(doc)
-    chunks: list[str] = []
-    for block in _iter_docx_body_blocks(doc):
-        if isinstance(block, Table):
-            if _docx_should_emit_markdown_table(block):
-                t = _docx_table_to_md(
-                    block, assets, prefix, img_counter, numbering=numbering
-                )
+    docx_path, temps = _prepare_docx_for_reading(source)
+    try:
+        doc = Document(str(docx_path))
+        assets = _assets_dir(md_path)
+        prefix = _rel_assets_prefix(md_path)
+        img_counter = [0]
+        numbering = _DocxNumberingResolver(doc)
+        chunks: list[str] = []
+        for block in _iter_docx_body_blocks(doc):
+            if isinstance(block, Table):
+                if _docx_should_emit_markdown_table(block):
+                    t = _docx_table_to_md(
+                        block, assets, prefix, img_counter, numbering=numbering
+                    )
+                else:
+                    t = _docx_flatten_table_as_text(
+                        block, assets, prefix, img_counter, numbering=numbering
+                    )
+                if t:
+                    chunks.append(t)
             else:
-                t = _docx_flatten_table_as_text(
-                    block, assets, prefix, img_counter, numbering=numbering
+                line = _docx_paragraph_to_md(
+                    block, assets, prefix, img_counter, numbering
                 )
-            if t:
-                chunks.append(t)
-        else:
-            line = _docx_paragraph_to_md(block, assets, prefix, img_counter, numbering)
-            if line.strip():
-                chunks.append(line.strip())
-    return "\n\n".join(chunks)
+                if line.strip():
+                    chunks.append(line.strip())
+        return "\n\n".join(chunks)
+    finally:
+        for t in temps:
+            try:
+                t.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ----- PDF -----
@@ -1372,13 +1492,110 @@ def convert_pdf_structured(source: Path, md_path: Path) -> str:
     return "\n\n".join(md_pages)
 
 
-# ----- .doc → .docx 预转换（Windows + 本机 Microsoft Word） -----
+# ----- .doc / .docx 预转换与 docx 包修复（Windows + 本机 Microsoft Word） -----
 
 
-def _doc_to_docx_via_word(src: Path) -> Path:
+def _docx_is_valid_zip(path: Path) -> bool:
+    import zipfile
+
+    return zipfile.is_zipfile(path)
+
+
+def _docx_rels_source_dir(rels_path: str) -> str:
     """
-    用本机 Microsoft Word（pywin32 / COM）把 .doc 转成临时 .docx，返回临时文件 Path。
-    调用方在用完后负责删除该文件（建议放在 try/finally 里）。
+    Relationship Target 相对「源 part」解析，不是相对 .rels 文件本身。
+    - _rels/.rels → 包根目录
+    - word/_rels/document.xml.rels → word/
+    """
+    if rels_path.replace("\\", "/") == "_rels/.rels":
+        return ""
+    marker = "/_rels/"
+    if marker in rels_path.replace("\\", "/"):
+        norm = rels_path.replace("\\", "/")
+        part_path = norm.replace("/_rels/", "/").removesuffix(".rels")
+        if "/" in part_path:
+            return part_path.rsplit("/", 1)[0]
+        return ""
+    return ""
+
+
+def _docx_rels_resolve_target(rels_path: str, target: str) -> str:
+    """把 .rels 里的 Target 解析为包内 part 路径（如 word/media/image1.jpeg）。"""
+    base = _docx_rels_source_dir(rels_path)
+    combined = f"{base}/{target}" if base else target
+    combined = combined.replace("\\", "/")
+    parts: list[str] = []
+    for seg in combined.split("/"):
+        if seg == "..":
+            if parts:
+                parts.pop()
+        elif seg and seg != ".":
+            parts.append(seg)
+    return "/".join(parts)
+
+
+def _sanitize_docx_broken_rels(src: Path) -> Path | None:
+    """
+    移除 docx 包内指向 NULL / 不存在 part 的 Relationship。
+    Word 能打开但 python-docx 会报 KeyError: "There is no item named 'NULL' in the archive"。
+    若有修改则写入临时 docx 并返回其 Path；无需修改则返回 None。
+    """
+    import os
+    import tempfile
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    rel_tag = f"{{{rel_ns}}}Relationship"
+    ET.register_namespace("", rel_ns)
+
+    modified = False
+    updates: dict[str, bytes] = {}
+
+    with zipfile.ZipFile(src, "r") as zin:
+        names = set(zin.namelist())
+        for name in zin.namelist():
+            if not name.endswith(".rels"):
+                continue
+            root = ET.fromstring(zin.read(name))
+            changed = False
+            for rel in list(root.findall(f".//{rel_tag}")):
+                target = rel.get("Target") or ""
+                if not target or "NULL" in target.upper():
+                    root.remove(rel)
+                    changed = True
+                    continue
+                if rel.get("TargetMode") == "External":
+                    continue
+                part = _docx_rels_resolve_target(name, target)
+                if part not in names:
+                    root.remove(rel)
+                    changed = True
+            if changed:
+                modified = True
+                updates[name] = ET.tostring(
+                    root, encoding="utf-8", xml_declaration=True
+                )
+
+        if not modified:
+            return None
+
+        fd, tmp_str = tempfile.mkstemp(suffix=".docx", prefix="_docx_fix_")
+        os.close(fd)
+        out_path = Path(tmp_str)
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = updates.get(info.filename)
+                if data is None:
+                    data = zin.read(info.filename)
+                zout.writestr(info, data)
+        return out_path
+
+
+def _docx_resave_via_word(src: Path) -> Path:
+    """
+    用本机 Microsoft Word（pywin32 / COM）把 .doc / .docx 另存为临时 .docx。
+    用于 .doc 预转换，或 ZIP 损坏 / python-docx 无法解析时的兜底修复。
     """
     import os
     import tempfile
@@ -1388,14 +1605,13 @@ def _doc_to_docx_via_word(src: Path) -> Path:
         import win32com.client  # type: ignore[import-not-found]
     except ImportError as e:
         raise RuntimeError(
-            "需要 pywin32 才能转换 .doc 文件。请运行: pip install pywin32\n"
+            "需要 pywin32 才能通过 Word 修复/转换 Office 文件。请运行: pip install pywin32\n"
             "并确认本机已安装 Microsoft Word。"
         ) from e
 
     src_abs = str(src.resolve())
 
-    # 先占位一个临时 .docx 路径，然后立刻删除，避免 SaveAs2 在已存在文件上失败
-    fd, tmp_str = tempfile.mkstemp(suffix=".docx", prefix="_doc2docx_")
+    fd, tmp_str = tempfile.mkstemp(suffix=".docx", prefix="_word_resave_")
     os.close(fd)
     try:
         os.unlink(tmp_str)
@@ -1413,7 +1629,7 @@ def _doc_to_docx_via_word(src: Path) -> Path:
 
         word.Visible = False
         try:
-            word.DisplayAlerts = 0  # wdAlertsNone
+            word.DisplayAlerts = 0
         except Exception:
             pass
 
@@ -1425,14 +1641,13 @@ def _doc_to_docx_via_word(src: Path) -> Path:
                 Visible=False,
             )
         except Exception as e:
-            raise RuntimeError(f"Word 打开 .doc 失败: {src} -> {e}") from e
+            raise RuntimeError(f"Word 无法打开文件: {src} -> {e}") from e
 
         try:
-            # FileFormat=16 即 wdFormatDocumentDefault (.docx)
             doc.SaveAs2(str(out_path.resolve()), FileFormat=16)
         finally:
             try:
-                doc.Close(SaveChanges=0)  # wdDoNotSaveChanges
+                doc.Close(SaveChanges=0)
             except Exception:
                 pass
     finally:
@@ -1444,8 +1659,72 @@ def _doc_to_docx_via_word(src: Path) -> Path:
         pythoncom.CoUninitialize()
 
     if not out_path.exists() or out_path.stat().st_size == 0:
-        raise RuntimeError(f".doc 转换失败，未生成有效 docx 文件: {out_path}")
+        raise RuntimeError(f"Word 另存为 docx 失败: {out_path}")
     return out_path
+
+
+def _doc_to_docx_via_word(src: Path) -> Path:
+    """.doc → 临时 .docx（委托 _docx_resave_via_word）。"""
+    return _docx_resave_via_word(src)
+
+
+def _prepare_docx_for_reading(src: Path) -> tuple[Path, list[Path]]:
+    """
+    打开 docx 前的预处理：无效 ZIP → Word 重存；无效 Relationship → 清理 NULL/缺失引用。
+    返回 (可读 docx 路径, 需删除的临时文件列表)。
+    """
+    temps: list[Path] = []
+    path = src.resolve()
+
+    if not _docx_is_valid_zip(path):
+        try:
+            path = _docx_resave_via_word(path)
+            temps.append(path)
+        except Exception as e:
+            raise RuntimeError(
+                f"「{src.name}」不是有效的 docx（ZIP 包损坏或不完整）。"
+                f"请用 Word 打开后「另存为 .docx」再试。Word 自动修复也失败: {e}"
+            ) from e
+
+    fixed = _sanitize_docx_broken_rels(path)
+    if fixed is not None:
+        temps.append(fixed)
+        path = fixed
+
+    try:
+        from docx import Document
+
+        Document(str(path))
+    except KeyError as e:
+        if "NULL" in str(e):
+            try:
+                path = _docx_resave_via_word(path if path not in temps else src)
+                if path not in temps:
+                    temps.append(path)
+                fixed2 = _sanitize_docx_broken_rels(path)
+                if fixed2 is not None:
+                    temps.append(fixed2)
+                    path = fixed2
+                from docx import Document
+
+                Document(str(path))
+            except Exception as e2:
+                raise RuntimeError(
+                    f"「{src.name}」含无效图片/资源引用（{e}），"
+                    f"自动修复后仍无法读取: {e2}"
+                ) from e2
+        else:
+            raise
+    except Exception as e:
+        err = str(e)
+        if "Package not found" in err or "not a zip file" in err.lower():
+            raise RuntimeError(
+                f"「{src.name}」无法作为 docx 读取: {e}\n"
+                "请用 Word 打开该文件，确认能正常打开后「另存为 .docx」再运行本脚本。"
+            ) from e
+        raise
+
+    return path, temps
 
 
 def convert_structured(source: Path, md_path: Path) -> None:
