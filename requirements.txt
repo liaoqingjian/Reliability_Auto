@@ -1,0 +1,8 @@
+# convert_office_to_markdown.py
+# Python 3.10+
+markitdown[all]
+python-docx
+pymupdf
+pdfplumber
+# .doc → .docx 预转换（Windows + 本机 Microsoft Word，仅 Windows 平台需要）
+pywin32; sys_platform == "win32"
