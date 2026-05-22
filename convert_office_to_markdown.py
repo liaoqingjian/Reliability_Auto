@@ -24,7 +24,7 @@ from pathlib import Path
 from markitdown import MarkItDown
 
 # ========== 在此修改为你的单个文件路径 ==========
-SOURCE_FILE = r"GZMR260100300601_CN.docx"
+SOURCE_FILE = r"CJ2603117R01E 上海通标 草稿.pdf"
 # 输出目录：None 表示与源文件同目录，生成「同名.md」及「同名_assets」资源目录
 OUTPUT_DIR: Path | None = None
 ENABLE_PLUGINS = False
@@ -1330,13 +1330,14 @@ def _pdf_find_cell(
 
 def _pdf_cell_append_image(cell_text: str | None, img_md: str) -> str:
     """
-    在管道表格的单元格里追加图片 markdown。空格用 <br> 与原文本分隔，
-    避免后续 _table_data_to_md 把换行折成空格、把图片挤到一行尾。
+    在管道表格的单元格里追加图片 markdown，与原文本用空格分隔。
+    管道表单元格内不宜用 <br>（多数渲染器会原样显示）或换行（_table_data_to_md 会折成空格）；
+    ![](url) 在预览中通常会单独成行。
     """
     base = (cell_text or "").strip()
     if not base:
         return img_md
-    return f"{base}<br>{img_md}"
+    return f"{base} {img_md}"
 
 
 def convert_pdf_structured(source: Path, md_path: Path) -> str:
