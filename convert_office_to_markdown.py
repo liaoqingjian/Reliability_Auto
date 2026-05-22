@@ -24,7 +24,7 @@ from pathlib import Path
 from markitdown import MarkItDown
 
 # ========== 在此修改为你的单个文件路径 ==========
-SOURCE_FILE = r"CJ2603117R01E 上海通标 草稿.pdf"
+SOURCE_FILE = r"18933LWJ04-测试数据.pdf"
 # 输出目录：None 表示与源文件同目录，生成「同名.md」及「同名_assets」资源目录
 OUTPUT_DIR: Path | None = None
 ENABLE_PLUGINS = False
@@ -89,6 +89,104 @@ _DOCX_MC_ALTERNATE = (
 )
 
 _DOCX_CELL_NEST_MAX_DEPTH = 15
+
+_DOCX_CHECKBOX_CHECKED = "☑"
+_DOCX_CHECKBOX_UNCHECKED = "□"
+_DOCX_W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
+
+
+def _docx_truthy_ooxml(val: str | None) -> bool:
+    if val is None:
+        return False
+    return val.strip().lower() in ("1", "true", "on", "yes")
+
+
+def _docx_find_fldchar(run_el: object, fld_type: str) -> object | None:
+    from docx.oxml.ns import qn
+
+    for child in run_el:
+        if child.tag == qn("w:fldChar"):
+            if child.get(qn("w:fldCharType")) == fld_type:
+                return child
+    return None
+
+
+def _docx_form_checkbox_is_checked(ff_data: object) -> bool:
+    from docx.oxml.ns import qn
+
+    cb = ff_data.find(qn("w:checkBox"))
+    if cb is None:
+        return False
+    checked_el = cb.find(qn("w:checked"))
+    if checked_el is not None:
+        return _docx_truthy_ooxml(checked_el.get(qn("w:val")))
+    default_el = cb.find(qn("w:default"))
+    if default_el is not None:
+        return _docx_truthy_ooxml(default_el.get(qn("w:val")))
+    return False
+
+
+def _docx_checkbox_symbol(checked: bool) -> str:
+    return _DOCX_CHECKBOX_CHECKED if checked else _DOCX_CHECKBOX_UNCHECKED
+
+
+def _docx_sdt_checkbox_state(sdt_el: object) -> bool | None:
+    """内容控件复选框：None 表示非复选框 sdt。"""
+    cb = sdt_el.find(f".//{{{_DOCX_W14_NS}}}checkbox")
+    if cb is None:
+        return None
+    checked_el = cb.find(f"{{{_DOCX_W14_NS}}}checked")
+    if checked_el is not None:
+        return _docx_truthy_ooxml(checked_el.get(f"{{{_DOCX_W14_NS}}}val"))
+    return False
+
+
+def _docx_extract_legacy_form_field(
+    children: list,
+    start: int,
+    ff_data: object,
+    part: object,
+    assets_dir: Path,
+    rel_prefix: str,
+    img_counter: list[int],
+) -> tuple[int, str]:
+    """从 w:fldChar begin 起消费至对应 end，返回 (消费子节点数, 导出文本)。"""
+    from docx.oxml.ns import qn
+
+    cb = ff_data.find(qn("w:checkBox"))
+    text_input = ff_data.find(qn("w:textInput"))
+    dd_list = ff_data.find(qn("w:ddList"))
+    result_parts: list[str] = []
+    in_result = False
+    i = start + 1
+    while i < len(children):
+        child = children[i]
+        if child.tag == qn("w:r"):
+            for rc in child:
+                rc_tag = rc.tag
+                if rc_tag == qn("w:fldChar"):
+                    ftype = rc.get(qn("w:fldCharType"))
+                    if ftype == "separate":
+                        in_result = True
+                    elif ftype == "end":
+                        if cb is not None:
+                            return i - start + 1, _docx_checkbox_symbol(
+                                _docx_form_checkbox_is_checked(ff_data)
+                            )
+                        if text_input is not None or dd_list is not None:
+                            return i - start + 1, "".join(result_parts)
+                        return i - start + 1, ""
+                elif in_result:
+                    if rc_tag == qn("w:t"):
+                        result_parts.append(rc.text or "")
+                    elif rc_tag == qn("w:tab"):
+                        result_parts.append("\t")
+                    elif rc_tag in (qn("w:br"), qn("w:cr")):
+                        result_parts.append("\n")
+        i += 1
+    if cb is not None:
+        return i - start, _docx_checkbox_symbol(_docx_form_checkbox_is_checked(ff_data))
+    return i - start, "".join(result_parts)
 
 
 def _collapse_ws(s: str) -> str:
@@ -495,13 +593,36 @@ def _docx_walk_para_children(
     rel_prefix: str,
     img_counter: list[int],
 ) -> list[str]:
-    """按 w:p 下 XML 顺序遍历：超链接、内容控件、独立绘图等与 w:r 交错。"""
+    """按 w:p 下 XML 顺序遍历：超链接、内容控件、旧版表单域等与 w:r 交错。"""
     from docx.oxml.ns import qn
 
     pieces: list[str] = []
-    for c in el:
+    children = list(el)
+    i = 0
+    while i < len(children):
+        c = children[i]
         tag = c.tag
         if tag == qn("w:r"):
+            fld_begin = _docx_find_fldchar(c, "begin")
+            if fld_begin is not None:
+                ff_data = fld_begin.find(qn("w:ffData"))
+                if ff_data is not None and (
+                    ff_data.find(qn("w:checkBox")) is not None
+                    or ff_data.find(qn("w:textInput")) is not None
+                    or ff_data.find(qn("w:ddList")) is not None
+                ):
+                    consumed, text = _docx_extract_legacy_form_field(
+                        children,
+                        i,
+                        ff_data,
+                        part,
+                        assets_dir,
+                        rel_prefix,
+                        img_counter,
+                    )
+                    pieces.append(text)
+                    i += consumed
+                    continue
             pieces.extend(
                 _docx_process_run(c, part, assets_dir, rel_prefix, img_counter)
             )
@@ -510,6 +631,9 @@ def _docx_walk_para_children(
                 _docx_walk_para_children(c, part, assets_dir, rel_prefix, img_counter)
             )
         elif tag == qn("w:sdt"):
+            cb_state = _docx_sdt_checkbox_state(c)
+            if cb_state is not None:
+                pieces.append(_docx_checkbox_symbol(cb_state))
             sdtc = c.find(qn("w:sdtContent"))
             if sdtc is not None:
                 pieces.extend(
@@ -527,6 +651,7 @@ def _docx_walk_para_children(
             pieces.extend(
                 _docx_mc_alternate_images(c, part, assets_dir, rel_prefix, img_counter)
             )
+        i += 1
     return pieces
 
 
@@ -1340,6 +1465,177 @@ def _pdf_cell_append_image(cell_text: str | None, img_md: str) -> str:
     return f"{base} {img_md}"
 
 
+_PDF_CHECKBOX_MIN_SIZE = 5.0
+_PDF_CHECKBOX_MAX_SIZE = 20.0
+_PDF_LINE_Y_TOLERANCE = 3.5
+
+
+def _pdf_widget_checkbox_checked(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("yes", "on", "1", "true", "x")
+
+
+def _pdf_collect_drawn_checkboxes(page: object) -> list[dict]:
+    """从页面矢量绘制中识别小方框及框内叉号（Word 转 PDF 常见）。"""
+    outlines: list[object] = []
+    marks: list[object] = []
+    for d in page.get_drawings() or []:
+        if d.get("type") != "s":
+            continue
+        rect = d.get("rect")
+        if rect is None:
+            continue
+        w = float(rect.width)
+        h = float(rect.height)
+        if w < _PDF_CHECKBOX_MIN_SIZE or h < _PDF_CHECKBOX_MIN_SIZE:
+            continue
+        if w > _PDF_CHECKBOX_MAX_SIZE or h > _PDF_CHECKBOX_MAX_SIZE:
+            continue
+        items = d.get("items") or []
+        if len(items) == 1 and items[0][0] == "re":
+            outlines.append(rect)
+        elif items and all(it[0] == "l" for it in items):
+            marks.append(rect)
+
+    out: list[dict] = []
+    for rect in outlines:
+        checked = any(rect.intersects(m) for m in marks)
+        out.append(
+            {
+                "rect": rect,
+                "x0": float(rect.x0),
+                "y0": float(rect.y0),
+                "cx": (float(rect.x0) + float(rect.x1)) / 2.0,
+                "cy": (float(rect.y0) + float(rect.y1)) / 2.0,
+                "checked": checked,
+            }
+        )
+    return out
+
+
+def _pdf_collect_widget_checkboxes(page: object) -> list[dict]:
+    """AcroForm 交互式复选框。"""
+    import fitz
+
+    widget_type = getattr(fitz, "PDF_WIDGET_TYPE_CHECKBOX", 2)
+    out: list[dict] = []
+    for w in page.widgets() or []:
+        if w.field_type != widget_type:
+            continue
+        rect = w.rect
+        out.append(
+            {
+                "rect": rect,
+                "x0": float(rect.x0),
+                "y0": float(rect.y0),
+                "cx": (float(rect.x0) + float(rect.x1)) / 2.0,
+                "cy": (float(rect.y0) + float(rect.y1)) / 2.0,
+                "checked": _pdf_widget_checkbox_checked(w.field_value),
+            }
+        )
+    return out
+
+
+def _pdf_collect_page_checkboxes(page: object) -> list[dict]:
+    return _pdf_collect_drawn_checkboxes(page) + _pdf_collect_widget_checkboxes(page)
+
+
+def _pdf_group_line_items(items: list[dict], y_key: str = "y") -> list[list[dict]]:
+    if not items:
+        return []
+    sorted_items = sorted(
+        items, key=lambda it: (it[y_key], it.get("x", it.get("x0", 0.0)))
+    )
+    lines: list[list[dict]] = []
+    current: list[dict] = [sorted_items[0]]
+    base_y = sorted_items[0][y_key]
+    for it in sorted_items[1:]:
+        if abs(it[y_key] - base_y) <= _PDF_LINE_Y_TOLERANCE:
+            current.append(it)
+        else:
+            lines.append(current)
+            current = [it]
+            base_y = it[y_key]
+    lines.append(current)
+    for line in lines:
+        line.sort(key=lambda it: it.get("x", it.get("x0", 0.0)))
+    return lines
+
+
+def _pdf_assemble_checkbox_line(line: list[dict]) -> str:
+    parts: list[str] = []
+    for i, it in enumerate(line):
+        if it["type"] == "cb":
+            if parts:
+                parts.append(" ")
+            parts.append(_docx_checkbox_symbol(it["checked"]))
+        else:
+            if parts and line[i - 1]["type"] != "cb":
+                parts.append(" ")
+            parts.append(it["text"])
+    return "".join(parts)
+
+
+def _pdf_text_with_checkboxes_in_bbox(
+    page: object,
+    bbox: tuple[float, float, float, float],
+    page_checkboxes: list[dict],
+) -> str | None:
+    """在 bbox 内按 x 顺序合并矢量/表单复选框与文字；无复选框时返回 None。"""
+    x0, y0, x1, y1 = bbox
+    cbs = [
+        cb
+        for cb in page_checkboxes
+        if _point_in_rect(cb["cx"], cb["cy"], (x0, y0, x1, y1))
+    ]
+    if not cbs:
+        return None
+
+    items: list[dict] = [
+        {"x": cb["x0"], "y": cb["y0"], "type": "cb", "checked": cb["checked"]}
+        for cb in cbs
+    ]
+    for w in page.get_text("words") or []:
+        wx0, wy0, wx1, wy1, word, *_ = w
+        cx = (wx0 + wx1) / 2.0
+        cy = (wy0 + wy1) / 2.0
+        if _point_in_rect(cx, cy, (x0, y0, x1, y1)):
+            items.append(
+                {"x": float(wx0), "y": float(wy0), "type": "word", "text": word}
+            )
+
+    lines = _pdf_group_line_items(items)
+    return "\n".join(_pdf_assemble_checkbox_line(line) for line in lines).strip()
+
+
+def _pdf_enrich_table_checkboxes(
+    page: object,
+    data: list[list[str | None]],
+    cell_grid: list[list[tuple[float, float, float, float] | None]],
+    page_checkboxes: list[dict],
+) -> None:
+    if not page_checkboxes:
+        return
+    for ri, row in enumerate(data):
+        if ri >= len(cell_grid):
+            break
+        grid_row = cell_grid[ri]
+        for ci in range(len(row)):
+            if ci >= len(grid_row):
+                break
+            cell_bbox = grid_row[ci]
+            if cell_bbox is None:
+                continue
+            enriched = _pdf_text_with_checkboxes_in_bbox(
+                page, cell_bbox, page_checkboxes
+            )
+            if enriched is not None:
+                row[ci] = enriched
+
+
 def convert_pdf_structured(source: Path, md_path: Path) -> str:
     import fitz  # PyMuPDF
     import pdfplumber
@@ -1374,6 +1670,7 @@ def convert_pdf_structured(source: Path, md_path: Path) -> str:
                 page_rect = getattr(fitz_page, "rect", None)
                 page_w = float(page_rect.width) if page_rect else 0.0
                 page_h = float(page_rect.height) if page_rect else 0.0
+                page_checkboxes = _pdf_collect_page_checkboxes(fitz_page)
 
                 # 1) 表格：取 bbox + 单元格网格 + 文本网格（data 转成可变 list 便于注入图片）
                 tables_info: list[dict] = []
@@ -1390,11 +1687,15 @@ def convert_pdf_structured(source: Path, md_path: Path) -> str:
                             cell_grid.append(list(row.cells))
                     except Exception:
                         cell_grid = []
+                    data = [list(r) for r in data]
+                    _pdf_enrich_table_checkboxes(
+                        fitz_page, data, cell_grid, page_checkboxes
+                    )
                     x0, top, x1, bottom = bbox
                     tables_info.append(
                         {
                             "bbox": (float(x0), float(top), float(x1), float(bottom)),
-                            "data": [list(r) for r in data],
+                            "data": data,
                             "cells": cell_grid,
                         }
                     )
@@ -1470,6 +1771,13 @@ def convert_pdf_structured(source: Path, md_path: Path) -> str:
                         continue
                     if any(_point_in_rect(cx, cy, tb) for tb in table_bboxes):
                         continue
+                    enriched = _pdf_text_with_checkboxes_in_bbox(
+                        fitz_page,
+                        (float(x0), float(y0), float(x1), float(y1)),
+                        page_checkboxes,
+                    )
+                    if enriched is not None:
+                        text = enriched
                     text_items.append((y0, x0, text))
 
                 # 5) 页面级按 (y, x) 排序合并
