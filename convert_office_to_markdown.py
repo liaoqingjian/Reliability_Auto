@@ -7,8 +7,10 @@
 
 结构化导出（.docx / .pdf）：
 - Word：python-docx；图片按 OOXML 提取；无嵌套整表为管道表；有嵌套时仍输出外层管道表（格内为「说明文字（含子表，见下）」），子表与格内全文在表后「嵌套表格详情」中块级渲染。
-- PDF：pymupdf 取文本块；图片用 get_image_info(xrefs=True)（多数 PDF 在 get_text dict 里无 type==1 图块）；
-  pdfplumber 检表格；按块坐标排序合并（假设为可选中文字的电子版 PDF）。
+- PDF（电子版）：pymupdf 取文本块；图片用 get_image_info(xrefs=True)（多数 PDF 在 get_text dict 里无 type==1 图块）；
+  pdfplumber 检表格；按块坐标排序合并。
+- PDF（扫描版）：按页检测文字层；RapidOCR 识别文字 + table_cls / wired_table_rec / lineless_table_rec 识别表格，
+  再按坐标排序合并为 Markdown。
 
 需要 Python 3.10+。
 """
@@ -19,12 +21,13 @@ import hashlib
 import html as _html_lib
 import re
 import sys
+import time
 from pathlib import Path
 
 from markitdown import MarkItDown
 
 # ========== 在此修改为你的单个文件路径 ==========
-SOURCE_FILE = r"18933LWJ04-测试数据.pdf"
+SOURCE_FILE = r"ME-260429-01 培训及考核记录 60601-2-22_2019+A12026.pdf"
 # 输出目录：None 表示与源文件同目录，生成「同名.md」及「同名_assets」资源目录
 OUTPUT_DIR: Path | None = None
 ENABLE_PLUGINS = False
@@ -47,6 +50,19 @@ PDF_LOGO_HASH_BLOCKLIST: set[str] = set()
 PDF_LOGO_HASH_KEEPLIST: set[str] = set()
 # 落在表格单元格内的图片，跳过 logo 判定（表内图基本不会是装饰 logo）
 PDF_SKIP_LOGO_CHECK_IN_TABLE = True
+# ==================================================
+
+# ========== PDF 扫描版 OCR ==========
+# 总开关：False 时扫描页仅输出整页渲染图，不做 OCR
+PDF_ENABLE_SCANNED_OCR = True
+# 渲染 DPI（wired_table_rec 建议长边 ≤1500px；A4@150dpi 约 1240px）
+PDF_SCANNED_RENDER_DPI = 150
+# 单页可选中文字少于该值时视为扫描页
+PDF_SCANNED_MIN_TEXT_CHARS = 15
+# 非表格页跳过 wired/lineless table_rec（仍做 OCR）
+PDF_SCANNED_SKIP_TABLE_REC_ON_NON_TABLE_PAGES = True
+# 表格式线框启发式阈值：水平/竖直线像素占比均 ≥ 该值才视为含表格
+PDF_SCANNED_TABLE_LINE_MIN_RATIO = 0.002
 # ==================================================
 
 
@@ -1636,6 +1652,442 @@ def _pdf_enrich_table_checkboxes(
                 row[ci] = enriched
 
 
+def _pdf_page_text_char_count(page: object) -> int:
+    try:
+        return len(page.get_text("text").strip())
+    except Exception:
+        return 0
+
+
+def _pdf_page_is_scanned(page: object) -> bool:
+    return _pdf_page_text_char_count(page) < PDF_SCANNED_MIN_TEXT_CHARS
+
+
+def _pdf_render_page_bgr(page: object, dpi: float) -> object:
+    """PyMuPDF 页面 → OpenCV BGR ndarray。"""
+    import fitz
+    import numpy as np
+
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        img = img[:, :, :3]
+    return img
+
+
+class _ScannedPdfOcrEngines:
+    """RapidOCR / 表格识别引擎懒加载单例（一份 PDF 转换共用）。"""
+
+    _instance: _ScannedPdfOcrEngines | None = None
+
+    @classmethod
+    def get(cls) -> _ScannedPdfOcrEngines:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self) -> None:
+        self._ocr = None
+        self._table_cls = None
+        self._wired = None
+        self._lineless = None
+
+    @property
+    def ocr(self) -> object:
+        if self._ocr is None:
+            from rapidocr import RapidOCR
+
+            self._ocr = RapidOCR()
+        return self._ocr
+
+    @property
+    def table_cls(self) -> object:
+        if self._table_cls is None:
+            from table_cls import TableCls
+
+            self._table_cls = TableCls()
+        return self._table_cls
+
+    @property
+    def wired(self) -> object:
+        if self._wired is None:
+            from wired_table_rec.main import WiredTableInput, WiredTableRecognition
+
+            self._wired = WiredTableRecognition(WiredTableInput())
+        return self._wired
+
+    @property
+    def lineless(self) -> object:
+        if self._lineless is None:
+            from lineless_table_rec.main import (
+                LinelessTableInput,
+                LinelessTableRecognition,
+            )
+
+            self._lineless = LinelessTableRecognition(LinelessTableInput())
+        return self._lineless
+
+
+def _ocr_box_aabb(box: object) -> tuple[float, float, float, float]:
+    import numpy as np
+
+    arr = np.asarray(box, dtype=float).reshape(-1)
+    if arr.size >= 8:
+        xs = arr[0::2]
+        ys = arr[1::2]
+        return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+    if arr.size >= 4:
+        x0, y0, x1, y1 = arr[:4]
+        return float(min(x0, x1)), float(min(y0, y1)), float(max(x0, x1)), float(max(y0, y1))
+    return 0.0, 0.0, 0.0, 0.0
+
+
+def _cell_bboxes_to_aabbs(cell_bboxes: object | None) -> list[tuple[float, float, float, float]]:
+    if cell_bboxes is None:
+        return []
+    out: list[tuple[float, float, float, float]] = []
+    try:
+        for cb in cell_bboxes:
+            out.append(_ocr_box_aabb(cb))
+    except Exception:
+        return []
+    return out
+
+
+def _html_table_to_md(html: str) -> str:
+    """将 table_rec 输出的 HTML 转为 Markdown 管道表；含合并单元格时保留 HTML 块。"""
+    from html.parser import HTMLParser
+
+    if not html or "<table" not in html.lower():
+        return ""
+
+    class _TableExtract(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[list[str]] = []
+            self._cur_row: list[str] | None = None
+            self._in_cell = False
+            self._cell_parts: list[str] = []
+            self.has_merge = False
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attrs_d = {k: (v or "") for k, v in attrs}
+            if tag == "tr":
+                self._cur_row = []
+            elif tag in ("td", "th"):
+                self._in_cell = True
+                self._cell_parts = []
+                try:
+                    if int(attrs_d.get("rowspan", "1")) > 1:
+                        self.has_merge = True
+                    if int(attrs_d.get("colspan", "1")) > 1:
+                        self.has_merge = True
+                except ValueError:
+                    pass
+            elif tag == "br" and self._in_cell:
+                self._cell_parts.append(" ")
+
+        def handle_data(self, data: str) -> None:
+            if self._in_cell:
+                self._cell_parts.append(data)
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in ("td", "th") and self._in_cell:
+                text = re.sub(r"\s+", " ", "".join(self._cell_parts)).strip()
+                if self._cur_row is not None:
+                    self._cur_row.append(text)
+                self._in_cell = False
+            elif tag == "tr" and self._cur_row is not None:
+                if any(c.strip() for c in self._cur_row):
+                    self.rows.append(self._cur_row)
+                self._cur_row = None
+
+    parser = _TableExtract()
+    try:
+        parser.feed(html)
+    except Exception:
+        return html.strip()
+
+    if not parser.rows:
+        return ""
+    if parser.has_merge:
+        m = re.search(r"<table\b.*?</table>", html, flags=re.DOTALL | re.IGNORECASE)
+        return (m.group(0) if m else html).strip()
+    return _table_data_to_md(parser.rows)
+
+
+def _pdf_scanned_ocr_lines(
+    boxes: object,
+    texts: object,
+    cell_aabbs: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, str]]:
+    if boxes is None or texts is None:
+        return []
+    items: list[dict] = []
+    for box, txt in zip(boxes, texts):
+        text = (txt or "").strip()
+        if not text:
+            continue
+        x0, y0, x1, y1 = _ocr_box_aabb(box)
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        if any(_point_in_rect(cx, cy, cb) for cb in cell_aabbs):
+            continue
+        items.append({"x": x0, "y": y0, "type": "word", "text": text})
+    if not items:
+        return []
+    lines = _pdf_group_line_items(items)
+    out: list[tuple[float, float, str]] = []
+    for line in lines:
+        parts = [it["text"] for it in line if it.get("text")]
+        if not parts:
+            continue
+        y = min(it["y"] for it in line)
+        x = min(it["x"] for it in line)
+        out.append((y, x, " ".join(parts)))
+    return out
+
+
+def _pdf_scanned_page_likely_has_table(img: object) -> bool:
+    """启发式检测扫描页是否含明显表格式线框；考卷等非表格页返回 False。"""
+    try:
+        import cv2
+    except ImportError:
+        return True
+
+    if img is None or not hasattr(img, "shape"):
+        return False
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    h, w = gray.shape[:2]
+    if h < 80 or w < 80:
+        return False
+
+    max_side = max(h, w)
+    if max_side > 1200:
+        scale = 1200.0 / max_side
+        gray = cv2.resize(
+            gray,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+        h, w = gray.shape[:2]
+
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    min_h_len = max(w // 15, 30)
+    min_v_len = max(h // 15, 30)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_h_len, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_v_len))
+    h_lines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, h_kernel)
+    v_lines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, v_kernel)
+
+    area = float(h * w)
+    h_ratio = cv2.countNonZero(h_lines) / area
+    v_ratio = cv2.countNonZero(v_lines) / area
+    return (
+        h_ratio >= PDF_SCANNED_TABLE_LINE_MIN_RATIO
+        and v_ratio >= PDF_SCANNED_TABLE_LINE_MIN_RATIO
+    )
+
+
+def _pdf_scanned_recognize_table(
+    img: object,
+    engines: _ScannedPdfOcrEngines,
+    ocr_out: object | None = None,
+) -> tuple[str, list[tuple[float, float, float, float]], object | None]:
+    if ocr_out is None:
+        ocr_out = engines.ocr(img, return_word_box=True)
+    if ocr_out.boxes is None or ocr_out.txts is None or ocr_out.scores is None:
+        return "", [], ocr_out
+    ocr_result = list(zip(ocr_out.boxes, ocr_out.txts, ocr_out.scores))
+    if not ocr_result:
+        return "", [], ocr_out
+
+    if PDF_SCANNED_SKIP_TABLE_REC_ON_NON_TABLE_PAGES and not _pdf_scanned_page_likely_has_table(
+        img
+    ):
+        return "", [], ocr_out
+
+    cls, _ = engines.table_cls(img)
+    table_engine = engines.wired if cls == "wired" else engines.lineless
+    table_out = table_engine(img, ocr_result=ocr_result)
+    pred_html = getattr(table_out, "pred_html", None) or ""
+    table_md = _html_table_to_md(pred_html)
+    cell_aabbs = _cell_bboxes_to_aabbs(getattr(table_out, "cell_bboxes", None))
+    return table_md, cell_aabbs, ocr_out
+
+
+def _pdf_process_page_scanned(
+    fitz_page: object,
+    page_index: int,
+    *,
+    assets: Path,
+    prefix: str,
+    img_counter: list[int],
+    engines: _ScannedPdfOcrEngines,
+) -> str:
+    img = _pdf_render_page_bgr(fitz_page, PDF_SCANNED_RENDER_DPI)
+    page_items: list[tuple[float, float, str]] = []
+
+    if PDF_ENABLE_SCANNED_OCR:
+        ocr_out = engines.ocr(img, return_word_box=True)
+        table_md, cell_aabbs, ocr_out = _pdf_scanned_recognize_table(
+            img, engines, ocr_out=ocr_out
+        )
+        if table_md:
+            if cell_aabbs:
+                ty = min(cb[1] for cb in cell_aabbs)
+                tx = min(cb[0] for cb in cell_aabbs)
+            else:
+                ty, tx = 0.0, 0.0
+            page_items.append((ty, tx, table_md))
+
+        if ocr_out is not None and ocr_out.boxes is not None and ocr_out.txts is not None:
+            page_items.extend(
+                _pdf_scanned_ocr_lines(ocr_out.boxes, ocr_out.txts, cell_aabbs)
+            )
+    else:
+        img_counter[0] += 1
+        name = f"page{page_index + 1}_{img_counter[0]}.png"
+        try:
+            import cv2
+
+            cv2.imwrite(str(assets / name), img)
+            page_items.append((0.0, 0.0, f"![]({prefix}/{name})"))
+        except Exception:
+            pass
+
+    page_items.sort(key=lambda it: (it[0], it[1]))
+    return "\n\n".join(p[2] for p in page_items if p[2].strip())
+
+
+def _pdf_process_page_digital(
+    fitz_page: object,
+    plumber_page: object,
+    page_index: int,
+    *,
+    pages_images: list[dict],
+    xref_pages: dict[int, set[int]],
+    sha1_pages: dict[str, set[int]],
+    assets: Path,
+    prefix: str,
+    img_counter: list[int],
+    text_flags: int,
+) -> str:
+    page_rect = getattr(fitz_page, "rect", None)
+    page_w = float(page_rect.width) if page_rect else 0.0
+    page_h = float(page_rect.height) if page_rect else 0.0
+    page_checkboxes = _pdf_collect_page_checkboxes(fitz_page)
+
+    tables_info: list[dict] = []
+    for t in plumber_page.find_tables() or []:
+        bbox = t.bbox
+        if not bbox:
+            continue
+        data = t.extract()
+        if not data:
+            continue
+        cell_grid: list[list[tuple[float, float, float, float] | None]] = []
+        try:
+            for row in t.rows:
+                cell_grid.append(list(row.cells))
+        except Exception:
+            cell_grid = []
+        data = [list(r) for r in data]
+        _pdf_enrich_table_checkboxes(fitz_page, data, cell_grid, page_checkboxes)
+        x0, top, x1, bottom = bbox
+        tables_info.append(
+            {
+                "bbox": (float(x0), float(top), float(x1), float(bottom)),
+                "data": data,
+                "cells": cell_grid,
+            }
+        )
+
+    table_bboxes = [ti["bbox"] for ti in tables_info]
+
+    floating_imgs: list[tuple[float, float, str]] = []
+    for it in pages_images[page_index]:
+        x0, y0, x1, y1 = it["bbox"]
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+        target_table: dict | None = None
+        for tinfo in tables_info:
+            if _point_in_rect(cx, cy, tinfo["bbox"]):
+                target_table = tinfo
+                break
+
+        in_table = target_table is not None
+        if not (in_table and PDF_SKIP_LOGO_CHECK_IN_TABLE):
+            if _pdf_is_logo(it, page_w, page_h, xref_pages, sha1_pages):
+                continue
+
+        img_counter[0] += 1
+        name = f"page{page_index + 1}_{img_counter[0]}.{it['ext']}"
+        try:
+            (assets / name).write_bytes(it["bytes"])
+        except Exception:
+            continue
+        img_md = f"![]({prefix}/{name})"
+
+        if in_table:
+            ri, ci = _pdf_find_cell(target_table["cells"], cx, cy)
+            placed = False
+            if ri is not None and ci is not None:
+                data = target_table["data"]
+                if ri < len(data):
+                    row = data[ri]
+                    if ci >= len(row):
+                        row.extend([""] * (ci - len(row) + 1))
+                    row[ci] = _pdf_cell_append_image(row[ci], img_md)
+                    placed = True
+            if not placed:
+                floating_imgs.append((y0, x0, img_md))
+        else:
+            floating_imgs.append((y0, x0, img_md))
+
+    table_items: list[tuple[float, float, str]] = []
+    for tinfo in tables_info:
+        tmd = _table_data_to_md(tinfo["data"])
+        if not tmd:
+            continue
+        tx0, ttop, _, _ = tinfo["bbox"]
+        table_items.append((ttop, tx0, tmd))
+
+    blocks = fitz_page.get_text("dict", flags=text_flags).get("blocks", [])
+    text_items: list[tuple[float, float, str]] = []
+    for b in blocks:
+        if b.get("type", 0) != 0:
+            continue
+        bbox = b.get("bbox")
+        if not bbox:
+            continue
+        x0, y0, x1, y1 = bbox
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        text = _pdf_text_from_block(b)
+        if not text:
+            continue
+        if any(_point_in_rect(cx, cy, tb) for tb in table_bboxes):
+            continue
+        enriched = _pdf_text_with_checkboxes_in_bbox(
+            fitz_page,
+            (float(x0), float(y0), float(x1), float(y1)),
+            page_checkboxes,
+        )
+        if enriched is not None:
+            text = enriched
+        text_items.append((y0, x0, text))
+
+    page_items: list[tuple[float, float, str]] = []
+    page_items.extend(text_items)
+    page_items.extend(floating_imgs)
+    page_items.extend(table_items)
+    page_items.sort(key=lambda it: (it[0], it[1]))
+    return "\n\n".join(p[2] for p in page_items if p[2].strip())
+
+
 def convert_pdf_structured(source: Path, md_path: Path) -> str:
     import fitz  # PyMuPDF
     import pdfplumber
@@ -1646,10 +2098,10 @@ def convert_pdf_structured(source: Path, md_path: Path) -> str:
     img_counter = [0]
     md_pages: list[str] = []
     _text_flags = getattr(fitz, "TEXT_PRESERVE_WHITESPACE", 0)
+    ocr_engines = _ScannedPdfOcrEngines.get()
 
     fitz_doc = fitz.open(path)
     try:
-        # 第一遍：所有页的图片普查，建立 xref / sha1 → 出现页集合 索引
         pages_images: list[list[dict]] = []
         xref_pages: dict[int, set[int]] = {}
         sha1_pages: dict[str, set[int]] = {}
@@ -1666,128 +2118,29 @@ def convert_pdf_structured(source: Path, md_path: Path) -> str:
         try:
             for page_index in range(len(fitz_doc)):
                 fitz_page = fitz_doc[page_index]
-                plumber_page = plumber_doc.pages[page_index]
-                page_rect = getattr(fitz_page, "rect", None)
-                page_w = float(page_rect.width) if page_rect else 0.0
-                page_h = float(page_rect.height) if page_rect else 0.0
-                page_checkboxes = _pdf_collect_page_checkboxes(fitz_page)
-
-                # 1) 表格：取 bbox + 单元格网格 + 文本网格（data 转成可变 list 便于注入图片）
-                tables_info: list[dict] = []
-                for t in plumber_page.find_tables() or []:
-                    bbox = t.bbox
-                    if not bbox:
-                        continue
-                    data = t.extract()
-                    if not data:
-                        continue
-                    cell_grid: list[list[tuple[float, float, float, float] | None]] = []
-                    try:
-                        for row in t.rows:
-                            cell_grid.append(list(row.cells))
-                    except Exception:
-                        cell_grid = []
-                    data = [list(r) for r in data]
-                    _pdf_enrich_table_checkboxes(
-                        fitz_page, data, cell_grid, page_checkboxes
-                    )
-                    x0, top, x1, bottom = bbox
-                    tables_info.append(
-                        {
-                            "bbox": (float(x0), float(top), float(x1), float(bottom)),
-                            "data": data,
-                            "cells": cell_grid,
-                        }
-                    )
-
-                table_bboxes = [ti["bbox"] for ti in tables_info]
-
-                # 2) 图片：先按几何归属（落在哪张表/哪格），再按 logo 规则过滤页面级浮动图
-                floating_imgs: list[tuple[float, float, str]] = []
-                for it in pages_images[page_index]:
-                    x0, y0, x1, y1 = it["bbox"]
-                    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-
-                    target_table: dict | None = None
-                    for tinfo in tables_info:
-                        if _point_in_rect(cx, cy, tinfo["bbox"]):
-                            target_table = tinfo
-                            break
-
-                    in_table = target_table is not None
-                    if not (in_table and PDF_SKIP_LOGO_CHECK_IN_TABLE):
-                        if _pdf_is_logo(it, page_w, page_h, xref_pages, sha1_pages):
-                            continue
-
-                    # 写盘并生成 markdown 链接
-                    img_counter[0] += 1
-                    name = f"page{page_index + 1}_{img_counter[0]}.{it['ext']}"
-                    try:
-                        (assets / name).write_bytes(it["bytes"])
-                    except Exception:
-                        continue
-                    img_md = f"![]({prefix}/{name})"
-
-                    if in_table:
-                        ri, ci = _pdf_find_cell(target_table["cells"], cx, cy)
-                        placed = False
-                        if ri is not None and ci is not None:
-                            data = target_table["data"]
-                            if ri < len(data):
-                                row = data[ri]
-                                if ci >= len(row):
-                                    row.extend([""] * (ci - len(row) + 1))
-                                row[ci] = _pdf_cell_append_image(row[ci], img_md)
-                                placed = True
-                        if not placed:
-                            # 表内但定位不到具体单元格，退化为表附近的浮动图
-                            floating_imgs.append((y0, x0, img_md))
-                    else:
-                        floating_imgs.append((y0, x0, img_md))
-
-                # 3) 表格渲染（此时 data 已包含所属图片）
-                table_items: list[tuple[float, float, str]] = []
-                for tinfo in tables_info:
-                    tmd = _table_data_to_md(tinfo["data"])
-                    if not tmd:
-                        continue
-                    tx0, ttop, _, _ = tinfo["bbox"]
-                    table_items.append((ttop, tx0, tmd))
-
-                # 4) 文本块：中心点落在任一表 bbox 内的丢弃
-                blocks = fitz_page.get_text("dict", flags=_text_flags).get("blocks", [])
-                text_items: list[tuple[float, float, str]] = []
-                for b in blocks:
-                    if b.get("type", 0) != 0:
-                        # 图片多数不在 dict 的 type==1 里；统一由 get_image_info 提取
-                        continue
-                    bbox = b.get("bbox")
-                    if not bbox:
-                        continue
-                    x0, y0, x1, y1 = bbox
-                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-                    text = _pdf_text_from_block(b)
-                    if not text:
-                        continue
-                    if any(_point_in_rect(cx, cy, tb) for tb in table_bboxes):
-                        continue
-                    enriched = _pdf_text_with_checkboxes_in_bbox(
+                if _pdf_page_is_scanned(fitz_page):
+                    body = _pdf_process_page_scanned(
                         fitz_page,
-                        (float(x0), float(y0), float(x1), float(y1)),
-                        page_checkboxes,
+                        page_index,
+                        assets=assets,
+                        prefix=prefix,
+                        img_counter=img_counter,
+                        engines=ocr_engines,
                     )
-                    if enriched is not None:
-                        text = enriched
-                    text_items.append((y0, x0, text))
-
-                # 5) 页面级按 (y, x) 排序合并
-                page_items: list[tuple[float, float, str]] = []
-                page_items.extend(text_items)
-                page_items.extend(floating_imgs)
-                page_items.extend(table_items)
-                page_items.sort(key=lambda it: (it[0], it[1]))
-
-                body = "\n\n".join(p[2] for p in page_items if p[2].strip())
+                else:
+                    plumber_page = plumber_doc.pages[page_index]
+                    body = _pdf_process_page_digital(
+                        fitz_page,
+                        plumber_page,
+                        page_index,
+                        pages_images=pages_images,
+                        xref_pages=xref_pages,
+                        sha1_pages=sha1_pages,
+                        assets=assets,
+                        prefix=prefix,
+                        img_counter=img_counter,
+                        text_flags=_text_flags,
+                    )
                 md_pages.append(
                     f"## 第 {page_index + 1} 页\n\n{body}"
                     if body
@@ -2082,18 +2435,21 @@ def main() -> int:
         return 1
 
     ext = src.suffix.lower()
+    t0 = time.perf_counter()
     try:
         if USE_STRUCTURED_EXTRACT and ext in {".doc", ".docx", ".pdf"}:
             out = _md_out_path(src, OUTPUT_DIR)
             convert_structured(src.resolve(), out)
-            print(f"OK（结构化）: {src} -> {out}")
+            elapsed = time.perf_counter() - t0
+            print(f"OK（结构化）: {src} -> {out}（耗时 {elapsed:.1f} 秒）")
         else:
             out = convert_to_markdown(
                 src,
                 output_dir=OUTPUT_DIR,
                 enable_plugins=ENABLE_PLUGINS,
             )
-            print(f"OK: {src} -> {out}")
+            elapsed = time.perf_counter() - t0
+            print(f"OK: {src} -> {out}（耗时 {elapsed:.1f} 秒）")
     except Exception as e:  # noqa: BLE001
         print(f"转换失败: {e}", file=sys.stderr)
         return 1
