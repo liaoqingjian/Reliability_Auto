@@ -9,5 +9,9 @@ lineless-table-rec
 table-cls
 onnxruntime
 opencv-python
+# 线上 OCR 后端（可选）：Azure Document Intelligence（prebuilt-read / prebuilt-layout）
+azure-ai-documentintelligence
+# 从 .env 读取 Azure 密钥
+python-dotenv
 # .doc → .docx 预转换（Windows + 本机 Microsoft Word，仅 Windows 平台需要）
 pywin32; sys_platform == "win32"

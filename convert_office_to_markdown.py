@@ -9,8 +9,10 @@
 - Word：python-docx；图片按 OOXML 提取；无嵌套整表为管道表；有嵌套时仍输出外层管道表（格内为「说明文字（含子表，见下）」），子表与格内全文在表后「嵌套表格详情」中块级渲染。
 - PDF（电子版）：pymupdf 取文本块；图片用 get_image_info(xrefs=True)（多数 PDF 在 get_text dict 里无 type==1 图块）；
   pdfplumber 检表格；按块坐标排序合并。
-- PDF（扫描版）：按页检测文字层；RapidOCR 识别文字 + table_cls / wired_table_rec / lineless_table_rec 识别表格，
-  再按坐标排序合并为 Markdown。
+- PDF（扫描版）：按页检测文字层；OCR 后端可切换：
+    * 本地 RapidOCR + table_cls / wired_table_rec / lineless_table_rec 识别表格；
+    * 线上 Azure Document Intelligence（无表页走 prebuilt-read，有表页走 prebuilt-layout）。
+  由 PDF_OCR_BACKEND 开关控制，最后按坐标排序合并为 Markdown。
 
 需要 Python 3.10+。
 """
@@ -27,7 +29,7 @@ from pathlib import Path
 from markitdown import MarkItDown
 
 # ========== 在此修改为你的单个文件路径 ==========
-SOURCE_FILE = r"ME-260429-01 培训及考核记录 60601-2-22_2019+A12026.pdf"
+SOURCE_FILE = r"1.pdf"
 # 输出目录：None 表示与源文件同目录，生成「同名.md」及「同名_assets」资源目录
 OUTPUT_DIR: Path | None = None
 ENABLE_PLUGINS = False
@@ -63,6 +65,18 @@ PDF_SCANNED_MIN_TEXT_CHARS = 15
 PDF_SCANNED_SKIP_TABLE_REC_ON_NON_TABLE_PAGES = True
 # 表格式线框启发式阈值：水平/竖直线像素占比均 ≥ 该值才视为含表格
 PDF_SCANNED_TABLE_LINE_MIN_RATIO = 0.002
+# ==================================================
+
+# ========== OCR 后端切换（本地 RapidOCR / 线上 Azure） ==========
+# "rapidocr"：本地 RapidOCR + wired/lineless 表格识别
+# "azure"   ：线上 Azure Document Intelligence（无表页用 prebuilt-read，
+#             有表页用 prebuilt-layout）
+PDF_OCR_BACKEND = "azure"
+# PDF_OCR_BACKEND = "rapidocr"
+# Azure 终结点 / 密钥；留空则回退到环境变量或 azure_ocr_backend 内默认值
+# 建议密钥放环境变量 AZURE_DOCUMENT_INTELLIGENCE_KEY，勿写入仓库
+AZURE_OCR_ENDPOINT = ""
+AZURE_OCR_KEY = ""
 # ==================================================
 
 
@@ -1919,6 +1933,54 @@ def _pdf_scanned_recognize_table(
     return table_md, cell_aabbs, ocr_out
 
 
+def _encode_bgr_to_png_bytes(img: object) -> bytes:
+    """BGR ndarray → PNG 字节（供 Azure 单页图上传）。"""
+    import cv2
+
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError("无法将渲染页编码为 PNG")
+    return buf.tobytes()
+
+
+def _pdf_scanned_ocr_azure(img: object) -> list[tuple[float, float, str]]:
+    """Azure Document Intelligence：无表页走 prebuilt-read，有表页走 prebuilt-layout。"""
+    import azure_ocr_backend
+
+    has_table = _pdf_scanned_page_likely_has_table(img)
+    png_bytes = _encode_bgr_to_png_bytes(img)
+    return azure_ocr_backend.recognize_page_items(
+        png_bytes,
+        has_table=has_table,
+        endpoint=AZURE_OCR_ENDPOINT or None,
+        api_key=AZURE_OCR_KEY or None,
+    )
+
+
+def _pdf_scanned_ocr_rapidocr(
+    img: object, engines: _ScannedPdfOcrEngines
+) -> list[tuple[float, float, str]]:
+    """本地 RapidOCR + wired/lineless 表格识别。"""
+    page_items: list[tuple[float, float, str]] = []
+    ocr_out = engines.ocr(img, return_word_box=True)
+    table_md, cell_aabbs, ocr_out = _pdf_scanned_recognize_table(
+        img, engines, ocr_out=ocr_out
+    )
+    if table_md:
+        if cell_aabbs:
+            ty = min(cb[1] for cb in cell_aabbs)
+            tx = min(cb[0] for cb in cell_aabbs)
+        else:
+            ty, tx = 0.0, 0.0
+        page_items.append((ty, tx, table_md))
+
+    if ocr_out is not None and ocr_out.boxes is not None and ocr_out.txts is not None:
+        page_items.extend(
+            _pdf_scanned_ocr_lines(ocr_out.boxes, ocr_out.txts, cell_aabbs)
+        )
+    return page_items
+
+
 def _pdf_process_page_scanned(
     fitz_page: object,
     page_index: int,
@@ -1932,35 +1994,45 @@ def _pdf_process_page_scanned(
     page_items: list[tuple[float, float, str]] = []
 
     if PDF_ENABLE_SCANNED_OCR:
-        ocr_out = engines.ocr(img, return_word_box=True)
-        table_md, cell_aabbs, ocr_out = _pdf_scanned_recognize_table(
-            img, engines, ocr_out=ocr_out
-        )
-        if table_md:
-            if cell_aabbs:
-                ty = min(cb[1] for cb in cell_aabbs)
-                tx = min(cb[0] for cb in cell_aabbs)
-            else:
-                ty, tx = 0.0, 0.0
-            page_items.append((ty, tx, table_md))
-
-        if ocr_out is not None and ocr_out.boxes is not None and ocr_out.txts is not None:
-            page_items.extend(
-                _pdf_scanned_ocr_lines(ocr_out.boxes, ocr_out.txts, cell_aabbs)
-            )
+        if PDF_OCR_BACKEND == "azure":
+            try:
+                page_items.extend(_pdf_scanned_ocr_azure(img))
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[第 {page_index + 1} 页] Azure OCR 失败，回退为整页渲染图: {e}",
+                    file=sys.stderr,
+                )
+                page_items.extend(
+                    _pdf_scanned_dump_page_image(img, page_index, assets, prefix, img_counter)
+                )
+        else:
+            page_items.extend(_pdf_scanned_ocr_rapidocr(img, engines))
     else:
-        img_counter[0] += 1
-        name = f"page{page_index + 1}_{img_counter[0]}.png"
-        try:
-            import cv2
-
-            cv2.imwrite(str(assets / name), img)
-            page_items.append((0.0, 0.0, f"![]({prefix}/{name})"))
-        except Exception:
-            pass
+        page_items.extend(
+            _pdf_scanned_dump_page_image(img, page_index, assets, prefix, img_counter)
+        )
 
     page_items.sort(key=lambda it: (it[0], it[1]))
     return "\n\n".join(p[2] for p in page_items if p[2].strip())
+
+
+def _pdf_scanned_dump_page_image(
+    img: object,
+    page_index: int,
+    assets: Path,
+    prefix: str,
+    img_counter: list[int],
+) -> list[tuple[float, float, str]]:
+    """不做 OCR / OCR 失败时的兜底：保存整页渲染图并以图片 markdown 占位。"""
+    img_counter[0] += 1
+    name = f"page{page_index + 1}_{img_counter[0]}.png"
+    try:
+        import cv2
+
+        cv2.imwrite(str(assets / name), img)
+        return [(0.0, 0.0, f"![]({prefix}/{name})")]
+    except Exception:
+        return []
 
 
 def _pdf_process_page_digital(
