@@ -29,7 +29,7 @@ from pathlib import Path
 from markitdown import MarkItDown
 
 # ========== 在此修改为你的单个文件路径 ==========
-SOURCE_FILE = r"1.pdf"
+SOURCE_FILE = r"原始_SHAT2601001848PCTXJ06_DBL 7381.10-CCT1-En (1).docx"
 # 输出目录：None 表示与源文件同目录，生成「同名.md」及「同名_assets」资源目录
 OUTPUT_DIR: Path | None = None
 ENABLE_PLUGINS = False
@@ -111,6 +111,43 @@ def _ext_from_content_type(content_type: str) -> str:
         "image/x-emf": "emf",
     }
     return m.get(content_type.lower().split(";")[0].strip(), "bin")
+
+
+def _md_image_ref(url: str, alt: str = "") -> str:
+    """生成 markdown 图片引用；用 <> 包裹 URL，避免路径含括号时被误解析。"""
+    return f"![{alt}](<{url}>)"
+
+
+def _parse_md_image_ref(s: str, start: int) -> tuple[str, str, int] | None:
+    """从 start 处解析 markdown 图片 ![alt](url) 或 ![alt](<url>)。返回 (alt, url, end_index)。"""
+    if start >= len(s) or s[start : start + 2] != "![":
+        return None
+    alt_end = s.find("]", start + 2)
+    if alt_end == -1:
+        return None
+    alt = s[start + 2 : alt_end]
+    if alt_end + 1 >= len(s) or s[alt_end + 1] != "(":
+        return None
+    i = alt_end + 2
+    if i >= len(s):
+        return None
+    if s[i] == "<":
+        close = s.find(">", i + 1)
+        if close == -1 or close + 1 >= len(s) or s[close + 1] != ")":
+            return None
+        return alt, s[i + 1 : close], close + 2
+    depth = 1
+    url_start = i
+    while i < len(s):
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return alt, s[url_start:i], i + 1
+        i += 1
+    return None
 
 
 # OOXML：python-docx 的 qn() 未注册 mc 前缀，须用 Clark 名
@@ -500,6 +537,10 @@ def _docx_save_image_rid(
     blob = getattr(rp, "blob", None)
     if not blob:
         return None
+    if len(img_counter) > 1 and isinstance(img_counter[1], set):
+        if r_id in img_counter[1]:
+            return None
+        img_counter[1].add(r_id)
     img_counter[0] += 1
     ct = getattr(rp, "content_type", "image/png")
     ext = _ext_from_content_type(ct)
@@ -508,7 +549,7 @@ def _docx_save_image_rid(
         (assets_dir / name).write_bytes(blob)
     except OSError:
         return None
-    return f"![]({rel_prefix}/{name})"
+    return _md_image_ref(f"{rel_prefix}/{name}")
 
 
 def _docx_emit_images_from_graphic(
@@ -545,6 +586,43 @@ def _docx_emit_images_from_graphic(
     return out
 
 
+def _docx_extract_textbox_texts(el: object) -> list[str]:
+    """从 w:txbxContent（含 VML / wps 文本框）收集可见文本。"""
+    from docx.oxml.ns import qn
+
+    seen: set[int] = set()
+    texts: list[str] = []
+    for txbx in el.iter(qn("w:txbxContent")):
+        key = id(txbx)
+        if key in seen:
+            continue
+        seen.add(key)
+        parts: list[str] = []
+        for t in txbx.iter(qn("w:t")):
+            if t.text:
+                parts.append(t.text)
+        text = "".join(parts).strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _docx_emit_content_from_graphic(
+    graphic_el: object,
+    part: object,
+    assets_dir: Path,
+    rel_prefix: str,
+    img_counter: list[int],
+) -> list[str]:
+    """在 w:drawing / w:pict / w:object 子树内收集图片与文本框文字。"""
+    out = _docx_emit_images_from_graphic(
+        graphic_el, part, assets_dir, rel_prefix, img_counter
+    )
+    for text in _docx_extract_textbox_texts(graphic_el):
+        out.append(text)
+    return out
+
+
 def _docx_mc_alternate_images(
     ac_el: object,
     part: object,
@@ -556,26 +634,24 @@ def _docx_mc_alternate_images(
 
     MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
     out: list[str] = []
-    choice = ac_el.find(f"{{{MC}}}Choice")
-    if choice is not None:
-        for sub in choice.iter():
-            if sub.tag in (qn("w:drawing"), qn("w:pict")):
+
+    def _collect_from(container: object) -> None:
+        for sub in container.iter():
+            if sub.tag in (qn("w:drawing"), qn("w:pict"), qn("w:object")):
                 out.extend(
-                    _docx_emit_images_from_graphic(
+                    _docx_emit_content_from_graphic(
                         sub, part, assets_dir, rel_prefix, img_counter
                     )
                 )
+
+    choice = ac_el.find(f"{{{MC}}}Choice")
+    if choice is not None:
+        _collect_from(choice)
         if out:
             return out
     fb = ac_el.find(f"{{{MC}}}Fallback")
     if fb is not None:
-        for sub in fb.iter():
-            if sub.tag in (qn("w:drawing"), qn("w:pict")):
-                out.extend(
-                    _docx_emit_images_from_graphic(
-                        sub, part, assets_dir, rel_prefix, img_counter
-                    )
-                )
+        _collect_from(fb)
     return out
 
 
@@ -599,13 +675,19 @@ def _docx_process_run(
             out.append("\n")
         elif tag == qn("w:drawing"):
             out.extend(
-                _docx_emit_images_from_graphic(
+                _docx_emit_content_from_graphic(
                     rc, part, assets_dir, rel_prefix, img_counter
                 )
             )
         elif tag == qn("w:pict"):
             out.extend(
-                _docx_emit_images_from_graphic(
+                _docx_emit_content_from_graphic(
+                    rc, part, assets_dir, rel_prefix, img_counter
+                )
+            )
+        elif tag == qn("w:object"):
+            out.extend(
+                _docx_emit_content_from_graphic(
                     rc, part, assets_dir, rel_prefix, img_counter
                 )
             )
@@ -671,9 +753,9 @@ def _docx_walk_para_children(
                         sdtc, part, assets_dir, rel_prefix, img_counter
                     )
                 )
-        elif tag in (qn("w:drawing"), qn("w:pict")):
+        elif tag in (qn("w:drawing"), qn("w:pict"), qn("w:object")):
             pieces.extend(
-                _docx_emit_images_from_graphic(
+                _docx_emit_content_from_graphic(
                     c, part, assets_dir, rel_prefix, img_counter
                 )
             )
@@ -1054,10 +1136,6 @@ def _docx_cell_has_nested(cell: object) -> bool:
 
 # ----- 嵌套表「就地」渲染：含嵌套的单元格用单行 HTML 表达 -----
 
-# 段落 markdown 字符串里识别 ![alt](url) 形式的图片（OOXML 走完后产物）。
-_IMG_MD_RE = re.compile(r"!\[(.*?)\]\(([^)]+)\)")
-
-
 def _html_escape_text(s: str) -> str:
     """HTML 文本节点转义（<>&\"'）。"""
     return _html_lib.escape(s or "", quote=True)
@@ -1071,16 +1149,24 @@ def _md_para_to_inline_html(s: str) -> str:
     if not s:
         return ""
     parts: list[str] = []
-    last = 0
-    for m in _IMG_MD_RE.finditer(s):
-        if m.start() > last:
-            parts.append(_html_escape_text(s[last : m.start()]))
-        alt = _html_lib.escape(m.group(1) or "", quote=True)
-        url = _html_lib.escape(m.group(2) or "", quote=True)
-        parts.append(f'<img src="{url}" alt="{alt}">')
-        last = m.end()
-    if last < len(s):
-        parts.append(_html_escape_text(s[last:]))
+    pos = 0
+    while pos < len(s):
+        idx = s.find("![", pos)
+        if idx == -1:
+            parts.append(_html_escape_text(s[pos:]))
+            break
+        if idx > pos:
+            parts.append(_html_escape_text(s[pos:idx]))
+        parsed = _parse_md_image_ref(s, idx)
+        if parsed is None:
+            parts.append(_html_escape_text(s[idx : idx + 2]))
+            pos = idx + 2
+            continue
+        alt, url, end = parsed
+        alt_esc = _html_lib.escape(alt or "", quote=True)
+        url_esc = _html_lib.escape(url or "", quote=True)
+        parts.append(f'<img src="{url_esc}" alt="{alt_esc}">')
+        pos = end
     return "".join(parts).replace("\n", " ")
 
 
@@ -1225,7 +1311,7 @@ def convert_docx_structured(source: Path, md_path: Path) -> str:
         doc = Document(str(docx_path))
         assets = _assets_dir(md_path)
         prefix = _rel_assets_prefix(md_path)
-        img_counter = [0]
+        img_counter = [0, set()]
         numbering = _DocxNumberingResolver(doc)
         chunks: list[str] = []
         for block in _iter_docx_body_blocks(doc):
@@ -2030,7 +2116,7 @@ def _pdf_scanned_dump_page_image(
         import cv2
 
         cv2.imwrite(str(assets / name), img)
-        return [(0.0, 0.0, f"![]({prefix}/{name})")]
+        return [(0.0, 0.0, _md_image_ref(f"{prefix}/{name}"))]
     except Exception:
         return []
 
@@ -2102,7 +2188,7 @@ def _pdf_process_page_digital(
             (assets / name).write_bytes(it["bytes"])
         except Exception:
             continue
-        img_md = f"![]({prefix}/{name})"
+        img_md = _md_image_ref(f"{prefix}/{name}")
 
         if in_table:
             ri, ci = _pdf_find_cell(target_table["cells"], cx, cy)
